@@ -1,0 +1,183 @@
+name: Build WSL ARM64 Kernel (Nevuly Rolling Snapdragon X)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: "Nevuly Rolling branch/tag/commit (use 'auto' for latest release-tracked branch)"
+        required: false
+        default: "auto"
+        type: string
+  schedule:
+    - cron: '0 0 * * 0'
+
+concurrency:
+  group: build-wsl-arm64-nevuly
+  cancel-in-progress: true
+
+jobs:
+  build-arm64:
+    name: Build ARM64 kernel image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ${{ runner.os }}-ccache-nevuly-arm64-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-nevuly-arm64-
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential flex bison bc dwarves libssl-dev libelf-dev \
+            gcc-14-aarch64-linux-gnu g++-14-aarch64-linux-gnu \
+            crossbuild-essential-arm64 ccache
+
+          sudo update-alternatives --install /usr/bin/aarch64-linux-gnu-gcc aarch64-linux-gnu-gcc /usr/bin/aarch64-linux-gnu-gcc-14 100
+          sudo update-alternatives --install /usr/bin/aarch64-linux-gnu-g++ aarch64-linux-gnu-g++ /usr/bin/aarch64-linux-gnu-g++-14 100
+
+      - name: Clone kernel source (Nevuly)
+        id: clone
+        run: |
+          REQUESTED_REF="${{ github.event.inputs.kernel_ref }}"
+
+          if [ -n "$REQUESTED_REF" ] && [ "$REQUESTED_REF" != "auto" ]; then
+            KERNEL_REF="$REQUESTED_REF"
+            echo "Using manually requested ref: $KERNEL_REF"
+          else
+            LATEST_TAG="$(curl -fsSL https://api.github.com/repos/Nevuly/WSL2-Linux-Kernel-Rolling/releases/latest | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1 || true)"
+            BRANCHES="$(curl -fsSL https://api.github.com/repos/Nevuly/WSL2-Linux-Kernel-Rolling/branches?per_page=100 | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' || true)"
+
+            KERNEL_REF=""
+            if [[ "$LATEST_TAG" =~ ([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+              CANDIDATE="wsl-${BASH_REMATCH[1]}.${BASH_REMATCH[2]}-rolling"
+              if echo "$BRANCHES" | grep -qx "$CANDIDATE"; then
+                KERNEL_REF="$CANDIDATE"
+              fi
+            fi
+
+            if [ -z "$KERNEL_REF" ]; then
+              KERNEL_REF="$(echo "$BRANCHES" | grep -E '^wsl-[0-9]+\.[0-9]+-rolling$' | sort -V | tail -n1)"
+            fi
+
+            if [ -z "$KERNEL_REF" ] && echo "$BRANCHES" | grep -qx "next"; then
+              KERNEL_REF="next"
+            fi
+
+            if [ -z "$KERNEL_REF" ] && echo "$BRANCHES" | grep -qx "master"; then
+              KERNEL_REF="master"
+            fi
+
+            if [ -z "$KERNEL_REF" ]; then
+              echo "Failed to determine kernel ref from release/branches"
+              exit 1
+            fi
+
+            echo "Auto-selected rolling ref: $KERNEL_REF"
+          fi
+
+          git clone --depth 1 --branch "$KERNEL_REF" https://github.com/Nevuly/WSL2-Linux-Kernel-Rolling.git linux
+
+          echo "KERNEL_REF=$KERNEL_REF" >> "$GITHUB_ENV"
+          echo "kernel_sha=$(git -C linux rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure kernel (base defconfig + local deltas)
+        run: |
+          export ARCH=arm64
+          export CROSS_COMPILE="ccache aarch64-linux-gnu-"
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+          export CCACHE_COMPILERCHECK=content
+          export KCFLAGS="-O3 -march=armv8.7-a+crypto -mtune=cortex-x4"
+
+          ccache -M 5G
+          ccache -z
+
+          cp linux/arch/arm64/configs/config-wsl-arm64 linux/.config
+
+          cd linux
+
+          # Extra debloat from working-config analysis (compile-heavy subsystems)
+          ./scripts/config --disable CONFIG_COMPILE_TEST
+          ./scripts/config --disable CONFIG_AUDIT
+          ./scripts/config --disable CONFIG_WLAN
+          ./scripts/config --disable CONFIG_WIRELESS
+          ./scripts/config --disable CONFIG_BT
+          ./scripts/config --disable CONFIG_SOUND
+          ./scripts/config --disable CONFIG_MEDIA_SUPPORT
+          ./scripts/config --disable CONFIG_VIDEO
+          ./scripts/config --disable CONFIG_DRM
+          ./scripts/config --disable CONFIG_ARM64_PLATFORM_DEVICES
+          ./scripts/config --disable CONFIG_XEN
+          ./scripts/config --disable CONFIG_SURFACE_PLATFORMS
+          ./scripts/config --disable CONFIG_MELLANOX_PLATFORM
+          ./scripts/config --disable CONFIG_GENERIC_PHY
+          ./scripts/config --disable CONFIG_PSTORE
+          ./scripts/config --disable CONFIG_DEBUG_KERNEL
+          ./scripts/config --disable CONFIG_PROFILING
+          ./scripts/config --disable CONFIG_KALLSYMS_ALL
+          ./scripts/config --disable CONFIG_KPROBES
+          ./scripts/config --disable CONFIG_UPROBES
+          ./scripts/config --disable CONFIG_FTRACE
+          ./scripts/config --disable CONFIG_FUNCTION_TRACER
+          ./scripts/config --disable CONFIG_DYNAMIC_FTRACE
+          ./scripts/config --disable CONFIG_HZ_1000
+          ./scripts/config --enable CONFIG_HZ_250
+          ./scripts/config --set-val CONFIG_HZ 250
+          
+          # Speed up compilation
+          ./scripts/config --disable CONFIG_DEBUG_INFO
+          ./scripts/config --disable CONFIG_DEBUG_INFO_BTF
+          ./scripts/config --enable CONFIG_DEBUG_INFO_NONE
+          ./scripts/config --disable CONFIG_KASAN
+          ./scripts/config --disable CONFIG_KCSAN
+          ./scripts/config --disable CONFIG_UBSAN
+          ./scripts/config --disable CONFIG_KCOV
+          ./scripts/config --disable CONFIG_GDB_SCRIPTS
+          ./scripts/config --disable CONFIG_RUST
+
+          make ARCH=arm64 KCFLAGS="$KCFLAGS" olddefconfig
+
+      - name: Build kernel
+        run: |
+          export ARCH=arm64
+          export CROSS_COMPILE="ccache aarch64-linux-gnu-"
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+          export KCFLAGS="-O3 -march=armv8.7-a+crypto -mtune=cortex-x4"
+
+          make -C linux ARCH=arm64 KCFLAGS="$KCFLAGS" -j"$(nproc)" Image modules
+          ccache -s
+
+      - name: Prepare artifacts
+        id: prep
+        run: |
+          BUILD_DATE="$(date -u +%Y%m%d)"
+          mkdir -p artifacts
+
+          cp linux/arch/arm64/boot/Image artifacts/Image-arm64
+          cp linux/.config artifacts/config-arm64-nevuly-base
+          cp linux/System.map artifacts/System.map-arm64
+          cp linux/Module.symvers artifacts/Module.symvers-arm64
+
+          {
+            echo "Kernel Source: Nevuly/WSL2-Linux-Kernel-Rolling"
+            echo "Ref: $KERNEL_REF"
+            echo "Commit: $(git -C linux rev-parse HEAD)"
+            echo "Date: $(date -u)"
+          } > artifacts/build-info.txt
+
+          echo "build_date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsl-arm64-${{ steps.prep.outputs.build_date }}-${{ steps.clone.outputs.kernel_sha }}
+          path: artifacts/
+          retention-days: 30
+          if-no-files-found: error

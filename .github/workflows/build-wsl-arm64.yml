@@ -1,0 +1,484 @@
+name: Build WSL ARM64 MSI (Nightly)
+
+on:
+  schedule:
+    # Run daily at 6:00 AM UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      wsl_ref:
+        description: 'Git ref to build (branch, tag, or SHA)'
+        required: false
+        default: 'master'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wsl-arm64-build
+  cancel-in-progress: true
+
+env:
+  WSL_REPO_URL: 'https://github.com/microsoft/WSL.git'
+  # Prevent NuGet credential-provider timeouts against Azure DevOps feeds
+  NUGET_PLUGIN_HANDSHAKE_TIMEOUT_IN_SECONDS: 60
+  NUGET_PLUGIN_REQUEST_TIMEOUT_IN_SECONDS: 60
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────
+  # Quick check: skip if the latest commit hasn't changed (scheduled only)
+  # ────────────────────────────────────────────────────────────────────
+  check-for-updates:
+    name: Check for new commits
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    outputs:
+      should_build: ${{ steps.decide.outputs.should_build }}
+      latest_sha: ${{ steps.check.outputs.latest_sha }}
+    steps:
+      - name: Get latest WSL commit SHA
+        id: check
+        run: |
+          latest_sha=$(git ls-remote "$WSL_REPO_URL" refs/heads/master | cut -f1)
+          echo "latest_sha=$latest_sha" >> "$GITHUB_OUTPUT"
+          echo "Latest WSL master SHA: $latest_sha"
+
+      - name: Restore last-built SHA cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: .last-built-sha
+          key: wsl-last-built-${{ steps.check.outputs.latest_sha }}
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          if [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
+            echo "WSL master unchanged since last build — skipping."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New commits detected — proceeding with build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ────────────────────────────────────────────────────────────────────
+  # Main build job
+  # ────────────────────────────────────────────────────────────────────
+  build-arm64-msi:
+    name: Build ARM64 MSI
+    runs-on: windows-latest
+    timeout-minutes: 180
+    needs: [check-for-updates]
+    # Run if: manual dispatch (check-for-updates is skipped) OR scheduled & new commits exist
+    if: |
+      always() &&
+      (needs.check-for-updates.result == 'skipped' ||
+       needs.check-for-updates.outputs.should_build != 'false')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Clone WSL source ──────────────────────────────────────────────
+      - name: Clone WSL source
+        shell: pwsh
+        run: |
+          $ref = '${{ inputs.wsl_ref }}'
+          if (-not $ref) { $ref = 'master' }
+          Write-Host "Cloning microsoft/WSL @ $ref ..."
+
+          # git clone --branch only accepts branch/tag names, not commit SHAs.
+          # Detect whether the ref looks like a hex SHA and handle accordingly.
+          if ($ref -match '^[0-9a-f]{7,40}$') {
+            git clone --filter=blob:none "$env:WSL_REPO_URL" wsl-src
+            git -C wsl-src checkout $ref
+          } else {
+            git clone --filter=blob:none --branch $ref --single-branch "$env:WSL_REPO_URL" wsl-src
+          }
+
+          # Ensure tags and history are available for git describe in version_functions.ps1
+          git -C wsl-src fetch --tags --force --prune
+          if (Test-Path "wsl-src/.git/shallow") { git -C wsl-src fetch --unshallow }
+
+          if ($LASTEXITCODE -ne 0) { throw "git clone/checkout failed (exit code $LASTEXITCODE)" }
+
+          Push-Location wsl-src
+          $hash     = git rev-parse --short HEAD
+          $fullHash = git rev-parse HEAD
+          $date     = git log -1 --format=%cd --date=short
+          Pop-Location
+
+          Write-Host "WSL commit: $hash ($date)"
+          "WSL_COMMIT_HASH=$hash"          >> $env:GITHUB_ENV
+          "WSL_COMMIT_FULL_HASH=$fullHash" >> $env:GITHUB_ENV
+          "WSL_COMMIT_DATE=$date"          >> $env:GITHUB_ENV
+          "BUILD_DATE=$(Get-Date -Format 'yyyy-MM-dd')" >> $env:GITHUB_ENV
+
+      # ── Ensure nuget.org feed is available for restores ──────────────
+      - name: Force nuget.org feed for restores
+        shell: pwsh
+        run: |
+          $config = Join-Path $PWD 'wsl-src/NuGet.Config'
+          $prefetch = Join-Path $PWD 'wsl-src/.nuget-prefetch'
+          $packages = Join-Path $PWD 'wsl-src/.nuget/packages'
+
+          Write-Host "Clearing NuGet locals to remove any corrupt cache"
+          nuget locals all -clear | Out-Host
+
+          Write-Host "Prefetching ref packs from nuget.org to avoid private feed auth"
+          New-Item -ItemType Directory -Path $prefetch -Force | Out-Null
+          
+          # Using nuget fallback folders to just extract/download the package bypassing project compatibility
+          Invoke-WebRequest "https://www.nuget.org/api/v2/package/Microsoft.NETCore.App.Ref/8.0.23" -OutFile "Microsoft.NETCore.App.Ref.8.0.23.nupkg"
+          nuget add Microsoft.NETCore.App.Ref.8.0.23.nupkg -source $prefetch
+          
+          Invoke-WebRequest "https://www.nuget.org/api/v2/package/Microsoft.WindowsDesktop.App.Ref/8.0.23" -OutFile "Microsoft.WindowsDesktop.App.Ref.8.0.23.nupkg"
+          nuget add Microsoft.WindowsDesktop.App.Ref.8.0.23.nupkg -source $prefetch
+
+          Invoke-WebRequest "https://www.nuget.org/api/v2/package/Microsoft.AspNetCore.App.Ref/8.0.23" -OutFile "Microsoft.AspNetCore.App.Ref.8.0.23.nupkg"
+          nuget add Microsoft.AspNetCore.App.Ref.8.0.23.nupkg -source $prefetch
+
+          Write-Host "Writing robust NuGet.Config handling WslDependencies gracefully"
+          $xml = @(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<configuration>'
+            '  <packageSources>'
+            '    <clear />'
+            "    <add key=`"local-prefetch`" value=`"$prefetch`" />"
+            '    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />'
+            '    <add key="WslDependencies" value="https://pkgs.dev.azure.com/shine-oss/wsl/_packaging/WslDependencies/nuget/v3/index.json" protocolVersion="3" />'
+            '  </packageSources>'
+            '</configuration>'
+          )
+
+          $xml | Out-File -FilePath $config -Encoding UTF8 -Force
+          Write-Host "NuGet.Config written to $config"
+
+          Write-Host "Patching wsl-src/cmake/findNuget.cmake to use newer nuget.exe (v6.11.1) for packageSourceMapping support"
+          $findNuget = Join-Path $PWD 'wsl-src/cmake/findNuget.cmake'
+          if (Test-Path $findNuget) {
+            $content = Get-Content $findNuget -Raw
+            $content = $content -replace "v5\.10\.0", "v6.11.1"
+            $content = $content -replace "EXPECTED_HASH SHA256=[a-fA-F0-9]+", ""
+            $content | Set-Content $findNuget
+            Write-Host "Patched $findNuget successfully (removed EXPECTED_HASH and bumped version)."
+          }
+
+          # Force downstream restore to use this config and an isolated packages folder
+          "NUGET_CONFIG_FILE=$config"    >> $env:GITHUB_ENV
+          "NUGET_PACKAGES=$packages"     >> $env:GITHUB_ENV
+          "NUGET_CREDENTIALPROVIDER_SESSIONTOKENCACHE_ENABLED=true" >> $env:GITHUB_ENV
+
+      # ── Locate Visual Studio ─────────────────────────────────────────
+      - name: Locate Visual Studio
+        id: vsinfo
+        shell: pwsh
+        run: |
+          $vsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath  = (& $vsWhere -latest -products * -property installationPath).Trim()
+          if (-not $vsPath) { throw "Visual Studio not found" }
+          Write-Host "Visual Studio path: $vsPath"
+          echo "path=$vsPath" >> "$GITHUB_OUTPUT"
+          "VS_PATH=$vsPath" >> $env:GITHUB_ENV
+
+      # ── Detect installed Windows SDK (official-friendly) ─────────────
+      - name: Detect installed Windows SDK
+        id: winsdk
+        shell: pwsh
+        run: |
+          $kitsRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\Include"
+          $sdk = Get-ChildItem -Path $kitsRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^10\.0\.(\d+)\.0$' } |
+            Sort-Object Name -Descending |
+            Select-Object -First 1 -ExpandProperty Name
+
+          if ($sdk) {
+            Write-Host "Detected Windows SDK: $sdk"
+            "WINSDK_VERSION=$sdk" >> $env:GITHUB_ENV
+            echo "version=$sdk" >> "$GITHUB_OUTPUT"
+          } else {
+            Write-Warning "No Windows SDK found under $kitsRoot"
+            echo "version=" >> "$GITHUB_OUTPUT"
+          }
+
+      # ── Check existing ARM64 MSVC toolchain ──────────────────────────
+      - name: Check ARM64 MSVC toolchain
+        id: vstools
+        shell: pwsh
+        run: |
+          $vsPath = '${{ steps.vsinfo.outputs.path }}'
+          $arm64 = Get-ChildItem -Path "$vsPath\VC\Tools\MSVC" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Get-ChildItem -Path $_.FullName -Recurse -Filter cl.exe -ErrorAction SilentlyContinue } |
+            Where-Object { $_.FullName -match "Hostx64\\arm64\\cl.exe" } |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          if ($arm64) {
+            Write-Host "Found ARM64 cl.exe: $arm64"
+            echo "has_arm64=true" >> "$GITHUB_OUTPUT"
+          } else {
+            Write-Warning "ARM64 MSVC toolchain not found"
+            echo "has_arm64=false" >> "$GITHUB_OUTPUT"
+          }
+
+      # ── Snapdragon X (Oryon) optimizations ────────────────────────────
+      - name: Apply Snapdragon X optimizations (baseline)
+        shell: pwsh
+        working-directory: wsl-src
+        run: |
+          Write-Host "Applying Snapdragon X (Oryon) CPU optimizations..."
+
+          # Patch CMakeLists.txt: target ARMv8.4-A for the Linux init binary
+          # Enables: LSE atomics, DotProd, RCPC, crypto extensions, FP16FML
+          $cmake = [IO.File]::ReadAllText("$PWD\CMakeLists.txt")
+          $old = 'set(LINUX_COMMON_FLAGS ${LINUX_COMMON_FLAGS} -D_ARM64_)'
+          $new = 'set(LINUX_COMMON_FLAGS ${LINUX_COMMON_FLAGS} -D_ARM64_ -march=armv8.4-a+crypto+dotprod+fp16fml)'
+          if ($cmake.Contains($old)) {
+            $cmake = $cmake.Replace($old, $new)
+            [IO.File]::WriteAllText("$PWD\CMakeLists.txt", $cmake)
+            Write-Host "  Linux init (Clang): -march=armv8.4-a+crypto+dotprod+fp16fml"
+            "SNAPDRAGON_OPTIMIZED=true" >> $env:GITHUB_ENV
+          } else {
+            Write-Warning "Could not find ARM64 Linux flags to patch — skipping Linux optimization"
+            "SNAPDRAGON_OPTIMIZED=false" >> $env:GITHUB_ENV
+          }
+
+      # ── Install VS components needed for ARM64 cross-compilation ──────
+      - name: Install required Visual Studio components
+        if: steps.vstools.outputs.has_arm64 != 'true' || steps.winsdk.outputs.version == ''
+        shell: pwsh
+        timeout-minutes: 45
+        run: |
+          $vsPath = $env:VS_PATH
+          $vsInstaller = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vs_installer.exe"
+
+          # Components required to build WSL for ARM64
+          # Includes C++ ARM64 cross-compiler, .NET desktop, WinUI, UWP, and Clang
+          $baseComponents = @(
+            'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
+            'Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre'
+            'Microsoft.VisualStudio.Component.VC.ATL.ARM64'
+            'Microsoft.VisualStudio.Component.VC.ATL.ARM64.Spectre'
+            'Microsoft.VisualStudio.Component.VC.Llvm.Clang'
+            'Microsoft.VisualStudio.ComponentGroup.UWP.Support'
+            'Microsoft.VisualStudio.ComponentGroup.UWP.VC.v143.BuildTools'
+            'Microsoft.VisualStudio.Workload.ManagedDesktop'
+            'Microsoft.VisualStudio.ComponentGroup.WindowsAppSDK.Cs'
+          )
+
+          # SDK fallback order: prefer 26100 (official), then 22621/22000 (hosted runners)
+          $sdkCandidates = @(
+            'Microsoft.VisualStudio.Component.Windows11SDK.26100'
+            'Microsoft.VisualStudio.Component.Windows11SDK.22621'
+            'Microsoft.VisualStudio.Component.Windows11SDK.22000'
+          )
+
+          $sdkFromEnv = '${{ steps.winsdk.outputs.version }}'
+          if ($sdkFromEnv) {
+            Write-Host "SDK already installed on runner: $sdkFromEnv (will not request SDK component)"
+            $sdkCandidates = @() # Skip SDK install if detected
+          }
+
+          function Install-VSComponents {
+            param([string[]]$components)
+            $argList = "modify --installPath `"$vsPath`" --quiet --norestart --nocache --wait"
+            foreach ($c in $components) { $argList += " --add $c" }
+            Write-Host "Installing VS components (this may take several minutes)..."
+            $proc = Start-Process -FilePath $vsInstaller -ArgumentList $argList -Wait -NoNewWindow -PassThru
+            return $proc.ExitCode
+          }
+
+          $exitCode = 999
+          foreach ($sdk in $sdkCandidates) {
+            $components = @($sdk) + $baseComponents
+            Write-Host "Attempting SDK component: $sdk"
+            $exitCode = Install-VSComponents -components $components
+            Write-Host "VS installer exit code: $exitCode"
+
+            if ($exitCode -in 0, 3010) { break }
+
+            if ($exitCode -eq 87) {
+              Write-Warning "Installer returned 87 (invalid component); trying next SDK fallback..."
+              continue
+            }
+
+            throw "VS installer failed with exit code $exitCode"
+          }
+
+          # Final fallback: try without adding any SDK component (hosted runners often have a preinstalled SDK)
+          if ($exitCode -eq 87 -or $sdkCandidates.Count -eq 0) {
+            Write-Warning "All SDK candidates unavailable or skipped; attempting install without SDK component (rely on preinstalled SDK)"
+            $exitCode = Install-VSComponents -components $baseComponents
+            Write-Host "VS installer exit code (no-SDK attempt): $exitCode"
+          }
+
+          # Final sanity check: if cl.exe and an SDK are present, continue even if installer returned 87
+          $arm64Cl = Get-ChildItem -Path "$vsPath\VC\Tools\MSVC" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Get-ChildItem -Path $_.FullName -Recurse -Filter cl.exe -ErrorAction SilentlyContinue } |
+            Where-Object { $_.FullName -match "Hostx64\\arm64\\cl.exe" } |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          $sdkDetected = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\Include" -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^10\.0\.(\d+)\.0$' } |
+            Sort-Object Name -Descending |
+            Select-Object -First 1 -ExpandProperty Name
+
+          $hasCl = [string]::IsNullOrEmpty($arm64Cl) -eq $false
+          $hasSdk = [string]::IsNullOrEmpty($sdkDetected) -eq $false
+
+          if ($exitCode -notin 0, 3010) {
+            if ($exitCode -eq 87 -and $hasCl -and ($hasSdk -or $sdkFromEnv)) {
+              Write-Warning "VS installer returned 87, but ARM64 toolchain and SDK are present; continuing."
+            } else {
+              throw "VS installer failed after all SDK fallbacks (last exit code $exitCode)"
+            }
+          }
+          Write-Host "VS components installed successfully (or already present)."
+
+      # ── .NET 6.0 is required by the WiX toolset (wix.exe) ────────────
+      - name: Setup .NET 6.0 (required by WiX)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '6.0.x'
+
+      # ── Install Azure Artifacts Credential Provider ───────────────────
+      # Ensures reliable NuGet downloads from the Azure DevOps WSL feed
+      - name: Install NuGet credential provider
+        shell: pwsh
+        run: |
+          Invoke-Expression "& { $(Invoke-RestMethod https://aka.ms/install-artifacts-credprovider.ps1) } -AddNetfx"
+
+      # ── Cleanup any corrupt WindowsDesktop ref pack cache ───────────
+      - name: Clear cached WindowsDesktop.App.Ref (8.0.23) if present
+        shell: pwsh
+        run: |
+          $pkgPath = Join-Path $env:USERPROFILE ".nuget\packages\microsoft.windowsdesktop.app.ref\8.0.23"
+          if (Test-Path $pkgPath) {
+            Write-Host "Removing cached package at $pkgPath to avoid corrupt ZIP reuse"
+            Remove-Item -Recurse -Force $pkgPath
+          } else {
+            Write-Host "No cached Microsoft.WindowsDesktop.App.Ref 8.0.23 found"
+          }
+
+      # ── CMake configure ──────────────────────────────────────────────
+      - name: Configure CMake for ARM64 Release
+        shell: pwsh
+        working-directory: wsl-src
+        run: |
+          # Snapdragon X baseline: target ARMv8.2 for all Windows binaries (MSVC) to enable LSE/CRC32/FP16
+          if ($env:SNAPDRAGON_OPTIMIZED -eq 'true') {
+            $env:CL = "/arch:armv8.2 $env:CL"
+            Write-Host "Snapdragon X: MSVC targeting /arch:armv8.2 (global)"
+          }
+
+          $sdkVersion = '${{ steps.winsdk.outputs.version }}'
+          if (-not $sdkVersion) { $sdkVersion = '10.0.26100.0' }
+          Write-Host "Using CMAKE_SYSTEM_VERSION=$sdkVersion"
+
+          cmake . --fresh -A arm64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_SYSTEM_VERSION=$sdkVersion `
+            -DSKIP_PACKAGE_SIGNING=true `
+            -DWSL_BUILD_WSL_SETTINGS=true
+
+      # ── Restore NuGet packages for WSL Settings (WinUI) ──────────────
+      - name: Restore NuGet packages
+        shell: pwsh
+        working-directory: wsl-src
+        run: |
+          # CMake's restore_nuget_packages() downloads nuget.exe into _deps.
+          # Run an additional restore for WSL Settings WinUI packages.
+          $nuget = Get-ChildItem -Path . -Recurse -Filter "nuget.exe" -ErrorAction SilentlyContinue |
+                   Select-Object -First 1 -ExpandProperty FullName
+          if ($nuget) {
+            Write-Host "Using NuGet at: $nuget"
+            & $nuget restore -NonInteractive
+          } else {
+            Write-Host "nuget.exe not found — packages were restored during CMake configure."
+          }
+
+      # ── Build ─────────────────────────────────────────────────────────
+      - name: Build ARM64 MSI package
+        shell: pwsh
+        working-directory: wsl-src
+        run: |
+          cmake --build . --config Release --target msipackage -- -m
+
+      # ── Collect artifact ──────────────────────────────────────────────
+      - name: Prepare artifacts
+        shell: pwsh
+        run: |
+          $msiSource = "wsl-src\bin\arm64\Release\wsl.msi"
+
+          if (-not (Test-Path $msiSource)) {
+            Write-Error "MSI not found at $msiSource"
+            Get-ChildItem -Recurse "wsl-src\bin\" -ErrorAction SilentlyContinue |
+              Select-Object FullName
+            exit 1
+          }
+
+          $sizeMB = [math]::Round((Get-Item $msiSource).Length / 1MB, 2)
+          Write-Host "MSI size: $sizeMB MB"
+
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          $destName = "wsl-arm64-$env:BUILD_DATE-$env:WSL_COMMIT_HASH.msi"
+          Copy-Item $msiSource "artifacts\$destName"
+
+          $ref = '${{ inputs.wsl_ref }}'
+          if (-not $ref) { $ref = 'master' }
+          $snapdragon = if ($env:SNAPDRAGON_OPTIMIZED -eq 'true') { 'Yes (MSVC /arch:armv8.2 + Clang armv8.4-a)' } else { 'No' }
+          @(
+            "Build Date:    $env:BUILD_DATE"
+            "WSL Commit:    $env:WSL_COMMIT_FULL_HASH"
+            "WSL Branch:    $ref"
+            "Platform:      ARM64"
+            "Configuration: Release"
+            "Snapdragon X:  $snapdragon"
+          ) | Out-File "artifacts\build-info.txt" -Encoding utf8
+
+          Write-Host "Artifact ready: $destName"
+
+      - name: Upload ARM64 MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsl-arm64-msi-${{ env.BUILD_DATE }}-${{ env.WSL_COMMIT_HASH }}
+          path: artifacts/
+          retention-days: 90
+          if-no-files-found: error
+
+      # ── Save the built SHA for dedup on next scheduled run ────────────
+      - name: Save last-built SHA
+        if: success() && github.event_name == 'schedule'
+        shell: bash
+        run: |
+          mkdir -p .last-built-sha
+          echo "$WSL_COMMIT_FULL_HASH" > .last-built-sha/sha.txt
+
+      - name: Update last-built SHA cache
+        if: success() && github.event_name == 'schedule'
+        uses: actions/cache/save@v4
+        with:
+          path: .last-built-sha
+          key: wsl-last-built-${{ env.WSL_COMMIT_FULL_HASH }}
+
+      # ── Job summary ───────────────────────────────────────────────────
+      - name: Build summary
+        if: always()
+        shell: pwsh
+        run: |
+          $status = if ("${{ job.status }}" -eq "success") { "✅ Success" } else { "❌ ${{ job.status }}" }
+          $snapdragon = if ($env:SNAPDRAGON_OPTIMIZED -eq 'true') { '✅ Enabled' } else { 'Disabled' }
+          $summary = @(
+            '## WSL ARM64 MSI Build'
+            ''
+            '| Property | Value |'
+            '|----------|-------|'
+            "| **Status** | $status |"
+            "| **WSL Commit** | ``$env:WSL_COMMIT_HASH`` |"
+            "| **Commit Date** | $env:WSL_COMMIT_DATE |"
+            "| **Build Date** | $env:BUILD_DATE |"
+            '| **Platform** | ARM64 |'
+            '| **Configuration** | Release |'
+            "| **Snapdragon X** | $snapdragon |"
+          ) -join "`n"
+          $summary >> $env:GITHUB_STEP_SUMMARY
