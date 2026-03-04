@@ -141,6 +141,7 @@ jobs:
           ./scripts/config --disable CONFIG_KCOV
           ./scripts/config --disable CONFIG_GDB_SCRIPTS
           ./scripts/config --disable CONFIG_RUST
+          ./scripts/config --set-str CONFIG_LOCALVERSION "-WSL2-STABLE-Const"
 
           make ARCH=arm64 KCFLAGS="$KCFLAGS" olddefconfig
 
