@@ -1,0 +1,372 @@
+name: Build Dark-Matter7232 WSL x64 MSI (Nightly)
+
+on:
+  schedule:
+    # Run daily at 6:00 AM UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      wsl_ref:
+        description: 'Git ref to build (branch, tag, or SHA)'
+        required: false
+        default: 'master'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: darkmatter-wsl-x64-build
+  cancel-in-progress: true
+
+env:
+  WSL_REPO_URL: 'https://github.com/Dark-Matter7232/WSL.git'
+  # Prevent NuGet credential-provider timeouts against Azure DevOps feeds
+  NUGET_PLUGIN_HANDSHAKE_TIMEOUT_IN_SECONDS: 60
+  NUGET_PLUGIN_REQUEST_TIMEOUT_IN_SECONDS: 60
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────
+  # Quick check: skip if the latest commit hasn't changed (scheduled only)
+  # ────────────────────────────────────────────────────────────────────
+  check-for-updates:
+    name: Check for new commits
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    outputs:
+      should_build: ${{ steps.decide.outputs.should_build }}
+      latest_sha: ${{ steps.check.outputs.latest_sha }}
+    steps:
+      - name: Get latest WSL commit SHA
+        id: check
+        run: |
+          latest_sha=$(git ls-remote "$WSL_REPO_URL" refs/heads/master | cut -f1)
+          echo "latest_sha=$latest_sha" >> "$GITHUB_OUTPUT"
+          echo "Latest Dark-Matter WSL master SHA: $latest_sha"
+
+      - name: Restore last-built SHA cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: .last-built-sha
+          key: wsl-last-built-${{ steps.check.outputs.latest_sha }}
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          if [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
+            echo "WSL master unchanged since last build — skipping."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New commits detected — proceeding with build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ────────────────────────────────────────────────────────────────────
+  # Main build job
+  # ────────────────────────────────────────────────────────────────────
+  build-x64-msi:
+    name: Build x64 MSI
+    runs-on: windows-latest
+    timeout-minutes: 180
+    needs: [check-for-updates]
+    # Run if: manual dispatch (check-for-updates is skipped) OR scheduled & new commits exist
+    if: |
+      always() &&
+      (needs.check-for-updates.result == 'skipped' ||
+       needs.check-for-updates.outputs.should_build != 'false')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Clone WSL source ──────────────────────────────────────────────
+      - name: Clone WSL source
+        shell: pwsh
+        run: |
+          $ref = '${{ inputs.wsl_ref }}'
+          if (-not $ref) { $ref = 'master' }
+          Write-Host "Cloning Dark-Matter7232/WSL @ $ref ..."
+
+          # git clone --branch only accepts branch/tag names, not commit SHAs.
+          # Detect whether the ref looks like a hex SHA and handle accordingly.
+          if ($ref -match '^[0-9a-f]{7,40}$') {
+            git clone --filter=blob:none "$env:WSL_REPO_URL" wsl-src
+            git -C wsl-src checkout $ref
+          } else {
+            git clone --filter=blob:none --branch $ref --single-branch "$env:WSL_REPO_URL" wsl-src
+          }
+
+          # Ensure tags and history are available for git describe in version_functions.ps1
+          git -C wsl-src fetch --tags --force --prune
+          if (Test-Path "wsl-src/.git/shallow") { git -C wsl-src fetch --unshallow }
+
+          if ($LASTEXITCODE -ne 0) { throw "git clone/checkout failed (exit code $LASTEXITCODE)" }
+
+          Push-Location wsl-src
+          $hash     = git rev-parse --short HEAD
+          $fullHash = git rev-parse HEAD
+          $date     = git log -1 --format=%cd --date=short
+          Pop-Location
+
+          Write-Host "WSL commit: $hash ($date)"
+          "WSL_COMMIT_HASH=$hash"          >> $env:GITHUB_ENV
+          "WSL_COMMIT_FULL_HASH=$fullHash" >> $env:GITHUB_ENV
+          "WSL_COMMIT_DATE=$date"          >> $env:GITHUB_ENV
+          "BUILD_DATE=$(Get-Date -Format 'yyyy-MM-dd')" >> $env:GITHUB_ENV
+
+      # ── Ensure nuget.org feed is available for restores ──────────────
+      - name: Force nuget.org feed for restores
+        shell: pwsh
+        run: |
+          $config = Join-Path $PWD 'wsl-src/NuGet.Config'
+          $prefetch = Join-Path $PWD 'wsl-src/.nuget-prefetch'
+          $packages = Join-Path $PWD 'wsl-src/.nuget/packages'
+
+          Write-Host "Clearing NuGet locals to remove any corrupt cache"
+          nuget locals all -clear | Out-Host
+
+          Write-Host "Prefetching ref packs from nuget.org to avoid private feed auth"
+          New-Item -ItemType Directory -Path $prefetch -Force | Out-Null
+          
+          # Using nuget fallback folders to just extract/download the package bypassing project compatibility
+          Invoke-WebRequest "https://www.nuget.org/api/v2/package/Microsoft.NETCore.App.Ref/8.0.23" -OutFile "Microsoft.NETCore.App.Ref.8.0.23.nupkg"
+          nuget add Microsoft.NETCore.App.Ref.8.0.23.nupkg -source $prefetch
+          
+          Invoke-WebRequest "https://www.nuget.org/api/v2/package/Microsoft.WindowsDesktop.App.Ref/8.0.23" -OutFile "Microsoft.WindowsDesktop.App.Ref.8.0.23.nupkg"
+          nuget add Microsoft.WindowsDesktop.App.Ref.8.0.23.nupkg -source $prefetch
+
+          Invoke-WebRequest "https://www.nuget.org/api/v2/package/Microsoft.AspNetCore.App.Ref/8.0.23" -OutFile "Microsoft.AspNetCore.App.Ref.8.0.23.nupkg"
+          nuget add Microsoft.AspNetCore.App.Ref.8.0.23.nupkg -source $prefetch
+
+          Write-Host "Writing robust NuGet.Config handling WslDependencies gracefully"
+          $xml = @(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<configuration>'
+            '  <packageSources>'
+            '    <clear />'
+            "    <add key=`"local-prefetch`" value=`"$prefetch`" />"
+            '    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />'
+            '    <add key="WslDependencies" value="https://pkgs.dev.azure.com/shine-oss/wsl/_packaging/WslDependencies/nuget/v3/index.json" protocolVersion="3" />'
+            '  </packageSources>'
+            '</configuration>'
+          )
+
+          $xml | Out-File -FilePath $config -Encoding UTF8 -Force
+          Write-Host "NuGet.Config written to $config"
+
+          Write-Host "Patching wsl-src/cmake/findNuget.cmake to use newer nuget.exe (v6.11.1) for packageSourceMapping support"
+          $findNuget = Join-Path $PWD 'wsl-src/cmake/findNuget.cmake'
+          if (Test-Path $findNuget) {
+            $content = Get-Content $findNuget -Raw
+            $content = $content -replace "v5\.10\.0", "v6.11.1"
+            $content = $content -replace "EXPECTED_HASH SHA256=[a-fA-F0-9]+", ""
+            $content | Set-Content $findNuget
+            Write-Host "Patched $findNuget successfully (removed EXPECTED_HASH and bumped version)."
+          }
+
+          # Force downstream restore to use this config and an isolated packages folder
+          "NUGET_CONFIG_FILE=$config"    >> $env:GITHUB_ENV
+          "NUGET_PACKAGES=$packages"     >> $env:GITHUB_ENV
+          "NUGET_CREDENTIALPROVIDER_SESSIONTOKENCACHE_ENABLED=true" >> $env:GITHUB_ENV
+
+      # ── Locate Visual Studio ─────────────────────────────────────────
+      - name: Locate Visual Studio
+        id: vsinfo
+        shell: pwsh
+        run: |
+          $vsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath  = (& $vsWhere -latest -products * -property installationPath).Trim()
+          if (-not $vsPath) { throw "Visual Studio not found" }
+          Write-Host "Visual Studio path: $vsPath"
+          echo "path=$vsPath" >> "$GITHUB_OUTPUT"
+          "VS_PATH=$vsPath" >> $env:GITHUB_ENV
+
+      # ── Detect installed Windows SDK (official-friendly) ─────────────
+      - name: Detect installed Windows SDK
+        id: winsdk
+        shell: pwsh
+        run: |
+          $kitsRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\Include"
+          $sdk = Get-ChildItem -Path $kitsRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^10\.0\.(\d+)\.0$' } |
+            Sort-Object Name -Descending |
+            Select-Object -First 1 -ExpandProperty Name
+
+          if ($sdk) {
+            Write-Host "Detected Windows SDK: $sdk"
+            "WINSDK_VERSION=$sdk" >> $env:GITHUB_ENV
+            echo "version=$sdk" >> "$GITHUB_OUTPUT"
+          } else {
+            Write-Warning "No Windows SDK found under $kitsRoot"
+            echo "version=" >> "$GITHUB_OUTPUT"
+          }
+
+      # ── Zen 4 optimizations ───────────────────────────────────────────
+      - name: Apply Zen 4 optimizations (baseline)
+        shell: pwsh
+        working-directory: wsl-src
+        run: |
+          Write-Host "Applying Zen 4 CPU optimizations..."
+
+          # Patch CMakeLists.txt: target x86-64-v4 and tune for Zen 4 for the Linux init binary
+          $cmake = [IO.File]::ReadAllText("$PWD\CMakeLists.txt")
+          $old = 'set(LINUX_COMMON_FLAGS ${LINUX_COMMON_FLAGS} -D_AMD64_)'
+          $new = 'set(LINUX_COMMON_FLAGS ${LINUX_COMMON_FLAGS} -D_AMD64_ -march=x86-64-v4 -mtune=znver4)'
+          if ($cmake.Contains($old)) {
+            $cmake = $cmake.Replace($old, $new)
+            [IO.File]::WriteAllText("$PWD\CMakeLists.txt", $cmake)
+            Write-Host "  Linux init (Clang): -march=x86-64-v4 -mtune=znver4"
+            "ZEN4_OPTIMIZED=true" >> $env:GITHUB_ENV
+          } else {
+            Write-Warning "Could not find x64 Linux flags to patch — skipping Linux optimization"
+            "ZEN4_OPTIMIZED=false" >> $env:GITHUB_ENV
+          }
+
+      # ── .NET 6.0 is required by the WiX toolset (wix.exe) ────────────
+      - name: Setup .NET 6.0 (required by WiX)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '6.0.x'
+
+      # ── Install Azure Artifacts Credential Provider ───────────────────
+      # Ensures reliable NuGet downloads from the Azure DevOps WSL feed
+      - name: Install NuGet credential provider
+        shell: pwsh
+        run: |
+          Invoke-Expression "& { $(Invoke-RestMethod https://aka.ms/install-artifacts-credprovider.ps1) } -AddNetfx"
+
+      # ── Cleanup any corrupt WindowsDesktop ref pack cache ───────────
+      - name: Clear cached WindowsDesktop.App.Ref (8.0.23) if present
+        shell: pwsh
+        run: |
+          $pkgPath = Join-Path $env:USERPROFILE ".nuget\packages\microsoft.windowsdesktop.app.ref\8.0.23"
+          if (Test-Path $pkgPath) {
+            Write-Host "Removing cached package at $pkgPath to avoid corrupt ZIP reuse"
+            Remove-Item -Recurse -Force $pkgPath
+          } else {
+            Write-Host "No cached Microsoft.WindowsDesktop.App.Ref 8.0.23 found"
+          }
+
+      # ── CMake configure ──────────────────────────────────────────────
+      - name: Configure CMake for x64 Release
+        shell: pwsh
+        working-directory: wsl-src
+        run: |
+          # MSVC has no Zen 4-specific codegen switch; /favor:AMD64 is the closest x64 tuning hint.
+          if ($env:ZEN4_OPTIMIZED -eq 'true') {
+            $env:CL = "/favor:AMD64 $env:CL"
+            Write-Host "Zen 4: MSVC targeting /favor:AMD64 (global)"
+          }
+
+          $sdkVersion = '${{ steps.winsdk.outputs.version }}'
+          if (-not $sdkVersion) { $sdkVersion = '10.0.26100.0' }
+          Write-Host "Using CMAKE_SYSTEM_VERSION=$sdkVersion"
+
+          cmake . --fresh -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_SYSTEM_VERSION=$sdkVersion `
+            -DSKIP_PACKAGE_SIGNING=true `
+            -DWSL_BUILD_WSL_SETTINGS=true
+
+      # ── Restore NuGet packages for WSL Settings (WinUI) ──────────────
+      - name: Restore NuGet packages
+        shell: pwsh
+        working-directory: wsl-src
+        run: |
+          # CMake's restore_nuget_packages() downloads nuget.exe into _deps.
+          # Run an additional restore for WSL Settings WinUI packages.
+          $nuget = Get-ChildItem -Path . -Recurse -Filter "nuget.exe" -ErrorAction SilentlyContinue |
+                   Select-Object -First 1 -ExpandProperty FullName
+          if ($nuget) {
+            Write-Host "Using NuGet at: $nuget"
+            & $nuget restore -NonInteractive
+          } else {
+            Write-Host "nuget.exe not found — packages were restored during CMake configure."
+          }
+
+      # ── Build ─────────────────────────────────────────────────────────
+      - name: Build x64 MSI package
+        shell: pwsh
+        working-directory: wsl-src
+        run: |
+          cmake --build . --config Release --target msipackage -- -m
+
+      # ── Collect artifact ──────────────────────────────────────────────
+      - name: Prepare artifacts
+        shell: pwsh
+        run: |
+          $msiSource = "wsl-src\bin\x64\Release\wsl.msi"
+
+          if (-not (Test-Path $msiSource)) {
+            Write-Error "MSI not found at $msiSource"
+            Get-ChildItem -Recurse "wsl-src\bin\" -ErrorAction SilentlyContinue |
+              Select-Object FullName
+            exit 1
+          }
+
+          $sizeMB = [math]::Round((Get-Item $msiSource).Length / 1MB, 2)
+          Write-Host "MSI size: $sizeMB MB"
+
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          $destName = "wsl-x64-$env:BUILD_DATE-$env:WSL_COMMIT_HASH.msi"
+          Copy-Item $msiSource "artifacts\$destName"
+
+          $ref = '${{ inputs.wsl_ref }}'
+          if (-not $ref) { $ref = 'master' }
+          $zen4 = if ($env:ZEN4_OPTIMIZED -eq 'true') { 'Yes (MSVC /favor:AMD64 + Clang x86-64-v4/znver4)' } else { 'No' }
+          @(
+            "Build Date:    $env:BUILD_DATE"
+            "WSL Commit:    $env:WSL_COMMIT_FULL_HASH"
+            "WSL Branch:    $ref"
+            "Platform:      x64"
+            "Configuration: Release"
+            "Zen 4:         $zen4"
+          ) | Out-File "artifacts\build-info.txt" -Encoding utf8
+
+          Write-Host "Artifact ready: $destName"
+
+      - name: Upload x64 MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsl-x64-msi-${{ env.BUILD_DATE }}-${{ env.WSL_COMMIT_HASH }}
+          path: artifacts/
+          retention-days: 90
+          if-no-files-found: error
+
+      # ── Save the built SHA for dedup on next scheduled run ────────────
+      - name: Save last-built SHA
+        if: success() && github.event_name == 'schedule'
+        shell: bash
+        run: |
+          mkdir -p .last-built-sha
+          echo "$WSL_COMMIT_FULL_HASH" > .last-built-sha/sha.txt
+
+      - name: Update last-built SHA cache
+        if: success() && github.event_name == 'schedule'
+        uses: actions/cache/save@v4
+        with:
+          path: .last-built-sha
+          key: wsl-last-built-${{ env.WSL_COMMIT_FULL_HASH }}
+
+      # ── Job summary ───────────────────────────────────────────────────
+      - name: Build summary
+        if: always()
+        shell: pwsh
+        run: |
+          $status = if ("${{ job.status }}" -eq "success") { "✅ Success" } else { "❌ ${{ job.status }}" }
+          $zen4 = if ($env:ZEN4_OPTIMIZED -eq 'true') { '✅ Enabled' } else { 'Disabled' }
+          $summary = @(
+            '## WSL x64 MSI Build'
+            ''
+            '| Property | Value |'
+            '|----------|-------|'
+            "| **Status** | $status |"
+            "| **WSL Commit** | ``$env:WSL_COMMIT_HASH`` |"
+            "| **Commit Date** | $env:WSL_COMMIT_DATE |"
+            "| **Build Date** | $env:BUILD_DATE |"
+            '| **Platform** | x64 |'
+            '| **Configuration** | Release |'
+            "| **Zen 4** | $zen4 |"
+          ) -join "`n"
+          $summary >> $env:GITHUB_STEP_SUMMARY
