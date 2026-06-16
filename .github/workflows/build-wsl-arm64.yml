@@ -281,7 +281,11 @@ jobs:
                    Select-Object -First 1 -ExpandProperty FullName
           if ($nuget) {
             Write-Host "Using NuGet at: $nuget"
-            & $nuget restore -NonInteractive
+            & $nuget restore "packages.config" `
+              -NonInteractive `
+              -SolutionDirectory $PWD `
+              -ConfigFile $env:NUGET_CONFIG_FILE `
+              -PackagesDirectory $env:NUGET_PACKAGES
           } else {
             Write-Host "nuget.exe not found — packages were restored during CMake configure."
           }
