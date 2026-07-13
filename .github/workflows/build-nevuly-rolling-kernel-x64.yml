@@ -108,7 +108,6 @@ jobs:
           ./scripts/config --disable CONFIG_SOUND
           ./scripts/config --disable CONFIG_MEDIA_SUPPORT
           ./scripts/config --disable CONFIG_VIDEO
-          ./scripts/config --disable CONFIG_DRM
           ./scripts/config --disable CONFIG_XEN
           ./scripts/config --disable CONFIG_SURFACE_PLATFORMS
           ./scripts/config --disable CONFIG_MELLANOX_PLATFORM
@@ -124,6 +123,8 @@ jobs:
           ./scripts/config --disable CONFIG_DYNAMIC_FTRACE
           ./scripts/config --disable CONFIG_HZ_1000
           ./scripts/config --enable CONFIG_HZ_250
+          ./scripts/config --enable CONFIG_DRM
+          ./scripts/config --enable CONFIG_DRM_VGEM
           ./scripts/config --set-val CONFIG_HZ 250
 
           # Speed up compilation
