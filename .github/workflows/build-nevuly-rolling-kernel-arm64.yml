@@ -130,6 +130,7 @@ jobs:
           ./scripts/config --enable CONFIG_HZ_250
           ./scripts/config --enable CONFIG_DRM
           ./scripts/config --enable CONFIG_DRM_VGEM
+          ./scripts/config --enable CONFIG_USBIP_VHCI_HCD
           ./scripts/config --set-val CONFIG_HZ 250
           
           # Speed up compilation
