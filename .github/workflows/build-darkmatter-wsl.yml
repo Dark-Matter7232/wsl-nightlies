@@ -273,8 +273,54 @@ jobs:
       # Ensures reliable NuGet downloads from the Azure DevOps WSL feed
       - name: Install NuGet credential provider
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          Invoke-Expression "& { $(Invoke-RestMethod https://aka.ms/install-artifacts-credprovider.ps1) } -AddNetfx"
+          # Authenticate the release lookup to avoid unauthenticated runner-IP rate limits.
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $release = Invoke-RestMethod `
+            -Uri 'https://api.github.com/repos/microsoft/artifacts-credprovider/releases/latest' `
+            -Headers $headers
+          if (-not $release.tag_name) {
+            throw 'Could not determine the latest Azure Artifacts Credential Provider release.'
+          }
+          $version = $release.tag_name
+          $extractPath = Join-Path $env:RUNNER_TEMP "artifacts-credprovider-$version"
+          $pluginsRoot = Join-Path $env:USERPROFILE '.nuget/plugins'
+          $providers = @(
+            @{ asset = 'Microsoft.NetFx48.NuGet.CredentialProvider.zip'; plugin = 'netfx' }
+            @{ asset = 'Microsoft.win-x64.NuGet.CredentialProvider.zip'; plugin = 'netcore' }
+          )
+
+          foreach ($provider in $providers) {
+            $providerWork = Join-Path $extractPath $provider.plugin
+            $pluginRoot = Join-Path $pluginsRoot $provider.plugin
+            New-Item -ItemType Directory -Path $providerWork, $pluginRoot -Force | Out-Null
+
+            $archivePath = Join-Path $providerWork $provider.asset
+            $assetInfo = $release.assets | Where-Object { $_.name -eq $provider.asset } | Select-Object -First 1
+            if (-not $assetInfo.browser_download_url) {
+              throw "Asset $($provider.asset) was not found in credential provider release $version."
+            }
+            Invoke-WebRequest -Uri $assetInfo.browser_download_url -OutFile $archivePath
+            Expand-Archive -LiteralPath $archivePath -DestinationPath $providerWork -Force
+
+            $providerSource = Join-Path $providerWork "plugins/$($provider.plugin)/CredentialProvider.Microsoft"
+            if (-not (Test-Path (Join-Path $providerSource 'CredentialProvider.Microsoft.exe'))) {
+              throw "Credential Provider executable was not found in $($provider.asset)"
+            }
+
+            $providerDestination = Join-Path $pluginRoot 'CredentialProvider.Microsoft'
+            if (Test-Path $providerDestination) {
+              Remove-Item $providerDestination -Recurse -Force
+            }
+            Copy-Item $providerSource -Destination $pluginRoot -Recurse -Force
+            Write-Host "Installed NuGet credential provider $version ($($provider.plugin)) to $providerDestination"
+          }
 
       # ── Cleanup any corrupt WindowsDesktop ref pack cache ───────────
       - name: Clear cached WindowsDesktop.App.Ref (8.0.23) if present
