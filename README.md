@@ -13,20 +13,15 @@
 
 This repository contains GitHub Actions workflows for both **Snapdragon/ARM64** and **x64** WSL builds.
 
-### 1. 🐧 Snapdragon / ARM64 MSI workflows
+### 1. 📦 MSI workflows
 * **Build WSL ARM64 MSI (Nightly):** Builds the upstream `microsoft/WSL` ARM64 MSI package.
-* **Build Dark-Matter7232 WSL ARM64 MSI (Nightly):** Builds the `Dark-Matter7232/WSL` ARM64 MSI package.
-* Targets **ARM64** Windows binaries and aligns with Snapdragon-focused optimization work in this repo.
+* **Build Dark-Matter7232 WSL MSI (Nightly):** Builds both ARM64 and x64 installers from `Dark-Matter7232/WSL` in parallel. ARM64 and x64 use architecture-specific optimization settings.
 
 ### 2. ⚡ Snapdragon / ARM64 kernel workflow
 * **Build WSL ARM64 Kernel (Nevuly Rolling Snapdragon X):** Builds the Nevuly rolling ARM64 kernel line.
 * Uses GCC 14 ARM64 cross-compilation and Snapdragon-oriented tuning for supported ARM64 hardware.
 
-### 3. 🖥️ x64 MSI workflow
-* **Build Dark-Matter7232 WSL x64 MSI (Nightly):** Builds the `Dark-Matter7232/WSL` x64 MSI package.
-* Configures the MSI build with `cmake -A x64` and applies x64-specific optimization settings where supported.
-
-### 4. ⚡ x64 kernel workflow
+### 3. ⚡ x64 kernel workflow
 * **Build WSL x64 Kernel (Nevuly Rolling Zen 4):** Builds the Nevuly rolling x64 kernel line.
 * Uses the Nevuly x86 WSL config and produces a `bzImage` artifact for x64 WSL use.
 
@@ -38,10 +33,9 @@ This repository contains GitHub Actions workflows for both **Snapdragon/ARM64** 
 
 ## ⬇️ Downloading builds
 
-1. Go to the [**Actions**](../../actions) tab.
-2. Select the workflow that matches your target architecture:
-   `Build WSL ARM64 MSI (Nightly)`, `Build Dark-Matter7232 WSL ARM64 MSI (Nightly)`, `Build WSL ARM64 Kernel (Nevuly Rolling Snapdragon X)`, `Build Dark-Matter7232 WSL x64 MSI (Nightly)`, or `Build WSL x64 Kernel (Nevuly Rolling Zen 4)`.
-3. Download the artifact from the run's artifacts section.
+The Dark-Matter WSL workflow publishes a dated **pre-release** containing both MSI installers and their build-info files whenever both architecture builds succeed. Browse the [nightly releases](../../releases) and download the ARM64 or x64 MSI for the matching system. If a build is rerun on the same day, it updates that day's release.
+
+For the Microsoft WSL MSI and the Nevuly kernel artifacts, go to the [**Actions**](../../actions) tab, select the corresponding workflow, then download the artifact from a successful run.
 
 > **💡 Tip:** The generated artifacts are compressed archives containing:
 > * **For ARM64 MSI:** typically `wsl-arm64-<date>-<commit>.msi` + `build-info.txt`
@@ -56,8 +50,7 @@ This repository contains GitHub Actions workflows for both **Snapdragon/ARM64** 
 You can trigger a build on-demand from the Actions tab → **[Workflow Name]** → **Run workflow**.
 
 ### ⏱️ Schedule
-* **ARM64 MSI workflows:** Daily at **06:00 UTC**.
-* **x64 MSI workflow:** Daily at **06:00 UTC**.
+* **MSI workflows:** Daily at **06:00 UTC**. The Dark-Matter workflow skips scheduled builds when the upstream commit has not changed.
 * **ARM64 Nevuly Rolling Kernel:** Weekly on Sunday at **00:00 UTC**.
 * **x64 Nevuly Rolling Kernel:** Weekly on Sunday at **00:00 UTC**.
 
@@ -145,5 +138,5 @@ Builds heavily target **AMD Zen 4** systems as the x64 baseline.
 ## 📝 Notes & License
 
 * These are **unofficial, unsigned** builds from the public WSL source code.
-* Artifacts are automatically deleted by GitHub after **90 days**.
+* Dark-Matter nightly releases remain available under [Releases](../../releases); workflow artifacts expire after **90 days**.
 * WSL is licensed under the [MIT License](https://github.com/microsoft/WSL/blob/master/LICENSE) by Microsoft. This repository only contains the build automation workflow.

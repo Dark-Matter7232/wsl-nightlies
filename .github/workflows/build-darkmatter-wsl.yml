@@ -1,4 +1,4 @@
-name: Build Dark-Matter7232 WSL ARM64 MSI (Nightly)
+name: Build Dark-Matter7232 WSL MSI (Nightly)
 
 on:
   schedule:
@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: darkmatter-wsl-arm64-build
+  group: darkmatter-wsl-build
   cancel-in-progress: true
 
 env:
@@ -63,11 +63,22 @@ jobs:
           fi
 
   # ────────────────────────────────────────────────────────────────────
-  # Main build job
-  # ────────────────────────────────────────────────────────────────────
-  build-arm64-msi:
-    name: Build ARM64 MSI
+  # Build both architectures in parallel from the same workflow definition.
+  build-msi:
+    name: Build ${{ matrix.name }} MSI
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ARM64
+            arch: arm64
+            cmake_arch: arm64
+            optimization: snapdragon
+          - name: x64
+            arch: x64
+            cmake_arch: x64
+            optimization: zen4
     timeout-minutes: 180
     needs: [check-for-updates]
     # Run if: manual dispatch (check-for-updates is skipped) OR scheduled & new commits exist
@@ -171,6 +182,14 @@ jobs:
           "NUGET_CREDENTIALPROVIDER_SESSIONTOKENCACHE_ENABLED=true" >> $env:GITHUB_ENV
 
       # ── Locate Visual Studio ─────────────────────────────────────────
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: wsl-src/.nuget/packages
+          key: ${{ runner.os }}-darkmatter-nuget-${{ matrix.arch }}-${{ hashFiles('wsl-src/packages.config') }}
+          restore-keys: |
+            ${{ runner.os }}-darkmatter-nuget-${{ matrix.arch }}-
+
       - name: Locate Visual Studio
         id: vsinfo
         shell: pwsh
@@ -204,6 +223,7 @@ jobs:
 
       # ── Snapdragon X (Oryon) optimizations ────────────────────────────
       - name: Apply Snapdragon X optimizations (baseline)
+        if: matrix.arch == 'arm64'
         shell: pwsh
         working-directory: wsl-src
         run: |
@@ -222,6 +242,25 @@ jobs:
           } else {
             Write-Warning "Could not find ARM64 Linux flags to patch — skipping Linux optimization"
             "SNAPDRAGON_OPTIMIZED=false" >> $env:GITHUB_ENV
+          }
+
+      - name: Apply Zen 4 optimizations (baseline)
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        working-directory: wsl-src
+        run: |
+          Write-Host "Applying Zen 4 CPU optimizations..."
+          $cmake = [IO.File]::ReadAllText("$PWD\CMakeLists.txt")
+          $old = 'set(LINUX_COMMON_FLAGS ${LINUX_COMMON_FLAGS} -D_AMD64_)'
+          $new = 'set(LINUX_COMMON_FLAGS ${LINUX_COMMON_FLAGS} -D_AMD64_ -march=x86-64-v4 -mtune=znver4)'
+          if ($cmake.Contains($old)) {
+            $cmake = $cmake.Replace($old, $new)
+            [IO.File]::WriteAllText("$PWD\CMakeLists.txt", $cmake)
+            Write-Host "  Linux init (Clang): -march=x86-64-v4 -mtune=znver4"
+            "ZEN4_OPTIMIZED=true" >> $env:GITHUB_ENV
+          } else {
+            Write-Warning "Could not find x64 Linux flags to patch — skipping Linux optimization"
+            "ZEN4_OPTIMIZED=false" >> $env:GITHUB_ENV
           }
 
       # ── .NET 6.0 is required by the WiX toolset (wix.exe) ────────────
@@ -250,21 +289,25 @@ jobs:
           }
 
       # ── CMake configure ──────────────────────────────────────────────
-      - name: Configure CMake for ARM64 Release
+      - name: Configure CMake for ${{ matrix.name }} Release
         shell: pwsh
         working-directory: wsl-src
         run: |
-          # Snapdragon X baseline: target ARMv8.2 for all Windows binaries (MSVC) to enable LSE/CRC32/FP16
-          if ($env:SNAPDRAGON_OPTIMIZED -eq 'true') {
+          # Apply architecture-specific MSVC tuning where supported.
+          if ('${{ matrix.arch }}' -eq 'arm64' -and $env:SNAPDRAGON_OPTIMIZED -eq 'true') {
             $env:CL = "/arch:armv8.2 $env:CL"
             Write-Host "Snapdragon X: MSVC targeting /arch:armv8.2 (global)"
+          }
+          if ('${{ matrix.arch }}' -eq 'x64' -and $env:ZEN4_OPTIMIZED -eq 'true') {
+            $env:CL = "/favor:AMD64 $env:CL"
+            Write-Host "Zen 4: MSVC targeting /favor:AMD64 (global)"
           }
 
           $sdkVersion = '${{ steps.winsdk.outputs.version }}'
           if (-not $sdkVersion) { $sdkVersion = '10.0.26100.0' }
           Write-Host "Using CMAKE_SYSTEM_VERSION=$sdkVersion"
 
-          cmake . --fresh -A arm64 `
+          cmake . --fresh -A ${{ matrix.cmake_arch }} `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_SYSTEM_VERSION=$sdkVersion `
             -DSKIP_PACKAGE_SIGNING=true `
@@ -291,7 +334,7 @@ jobs:
           }
 
       # ── Build ─────────────────────────────────────────────────────────
-      - name: Build ARM64 MSI package
+      - name: Build ${{ matrix.name }} MSI package
         shell: pwsh
         working-directory: wsl-src
         run: |
@@ -301,7 +344,7 @@ jobs:
       - name: Prepare artifacts
         shell: pwsh
         run: |
-          $msiSource = "wsl-src\bin\arm64\Release\wsl.msi"
+          $msiSource = "wsl-src\bin\${{ matrix.arch }}\Release\wsl.msi"
 
           if (-not (Test-Path $msiSource)) {
             Write-Error "MSI not found at $msiSource"
@@ -314,45 +357,30 @@ jobs:
           Write-Host "MSI size: $sizeMB MB"
 
           New-Item -ItemType Directory -Path artifacts -Force | Out-Null
-          $destName = "wsl-arm64-$env:BUILD_DATE-$env:WSL_COMMIT_HASH.msi"
+          $destName = "wsl-${{ matrix.arch }}-$env:BUILD_DATE-$env:WSL_COMMIT_HASH.msi"
           Copy-Item $msiSource "artifacts\$destName"
 
           $ref = '${{ inputs.wsl_ref }}'
           if (-not $ref) { $ref = 'master' }
-          $snapdragon = if ($env:SNAPDRAGON_OPTIMIZED -eq 'true') { 'Yes (MSVC /arch:armv8.2 + Clang armv8.4-a)' } else { 'No' }
+          $optimization = if ($env:SNAPDRAGON_OPTIMIZED -eq 'true') { 'Snapdragon X (MSVC /arch:armv8.2 + Clang armv8.4-a)' } elseif ($env:ZEN4_OPTIMIZED -eq 'true') { 'Zen 4 (MSVC /favor:AMD64 + Clang x86-64-v4/znver4)' } else { 'None' }
           @(
             "Build Date:    $env:BUILD_DATE"
             "WSL Commit:    $env:WSL_COMMIT_FULL_HASH"
             "WSL Branch:    $ref"
-            "Platform:      ARM64"
+            "Platform:      ${{ matrix.name }}"
             "Configuration: Release"
-            "Snapdragon X:  $snapdragon"
+            "CPU tuning:    $optimization"
           ) | Out-File "artifacts\build-info.txt" -Encoding utf8
 
           Write-Host "Artifact ready: $destName"
 
-      - name: Upload ARM64 MSI
+      - name: Upload ${{ matrix.name }} MSI
         uses: actions/upload-artifact@v4
         with:
-          name: wsl-arm64-msi-${{ env.BUILD_DATE }}-${{ env.WSL_COMMIT_HASH }}
+          name: wsl-${{ matrix.arch }}-msi-${{ env.BUILD_DATE }}-${{ env.WSL_COMMIT_HASH }}
           path: artifacts/
           retention-days: 90
           if-no-files-found: error
-
-      # ── Save the built SHA for dedup on next scheduled run ────────────
-      - name: Save last-built SHA
-        if: success() && github.event_name == 'schedule'
-        shell: bash
-        run: |
-          mkdir -p .last-built-sha
-          echo "$WSL_COMMIT_FULL_HASH" > .last-built-sha/sha.txt
-
-      - name: Update last-built SHA cache
-        if: success() && github.event_name == 'schedule'
-        uses: actions/cache/save@v4
-        with:
-          path: .last-built-sha
-          key: wsl-last-built-${{ env.WSL_COMMIT_FULL_HASH }}
 
       # ── Job summary ───────────────────────────────────────────────────
       - name: Build summary
@@ -360,9 +388,9 @@ jobs:
         shell: pwsh
         run: |
           $status = if ("${{ job.status }}" -eq "success") { "✅ Success" } else { "❌ ${{ job.status }}" }
-          $snapdragon = if ($env:SNAPDRAGON_OPTIMIZED -eq 'true') { '✅ Enabled' } else { 'Disabled' }
+          $optimization = if ($env:SNAPDRAGON_OPTIMIZED -eq 'true') { 'Snapdragon X enabled' } elseif ($env:ZEN4_OPTIMIZED -eq 'true') { 'Zen 4 enabled' } else { 'Disabled' }
           $summary = @(
-            '## WSL ARM64 MSI Build'
+            '## WSL ${{ matrix.name }} MSI Build'
             ''
             '| Property | Value |'
             '|----------|-------|'
@@ -370,8 +398,64 @@ jobs:
             "| **WSL Commit** | ``$env:WSL_COMMIT_HASH`` |"
             "| **Commit Date** | $env:WSL_COMMIT_DATE |"
             "| **Build Date** | $env:BUILD_DATE |"
-            '| **Platform** | ARM64 |'
+            '| **Platform** | ${{ matrix.name }} |'
             '| **Configuration** | Release |'
-            "| **Snapdragon X** | $snapdragon |"
+            "| **CPU tuning** | $optimization |"
           ) -join "`n"
           $summary >> $env:GITHUB_STEP_SUMMARY
+
+
+  record-successful-build:
+    name: Record successful scheduled build
+    runs-on: ubuntu-latest
+    needs: [check-for-updates, build-msi]
+    if: github.event_name == 'schedule' && needs.build-msi.result == 'success'
+    steps:
+      - name: Create last-built SHA marker
+        run: |
+          mkdir -p .last-built-sha
+          echo "${{ needs.check-for-updates.outputs.latest_sha }}" > .last-built-sha/sha.txt
+
+      - name: Save last-built WSL SHA
+        uses: actions/cache/save@v4
+        with:
+          path: .last-built-sha
+          key: wsl-last-built-${{ needs.check-for-updates.outputs.latest_sha }}
+
+  publish-nightly-release:
+    name: Publish nightly release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    needs: [check-for-updates, build-msi]
+    if: always() && needs.build-msi.result == 'success'
+    steps:
+      - name: Download MSI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wsl-*-msi-*
+          path: release-assets
+          merge-multiple: false
+
+      - name: Set nightly release metadata
+        id: release
+        shell: bash
+        run: |
+          echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          echo "tag=nightly-$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish nightly release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: WSL Nightly Build ${{ steps.release.outputs.date }}
+          prerelease: true
+          make_latest: false
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          files: release-assets/**/*
+          body: |
+            Dark-Matter7232 WSL nightly build for ${{ steps.release.outputs.date }}.
+
+            Includes ARM64 and x64 MSI installers with build information files.
+            Built from WSL ref `${{ inputs.wsl_ref || 'master' }}`.
