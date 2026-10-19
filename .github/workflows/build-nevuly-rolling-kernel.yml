@@ -1,4 +1,4 @@
-name: Build WSL x64 Kernel (Nevuly Rolling Zen 4)
+name: Build WSL Kernels (Nevuly Rolling)
 
 on:
   workflow_dispatch:
@@ -12,13 +12,42 @@ on:
     - cron: '0 0 * * 0'
 
 concurrency:
-  group: build-wsl-x64-nevuly
+  group: build-wsl-nevuly
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
-  build-x64:
-    name: Build x64 kernel image
+  build-kernel:
+    name: Build ${{ matrix.name }} kernel
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ARM64
+            arch: arm64
+            cache_arch: arm64
+            config_file: arch/arm64/configs/config-wsl-arm64
+            compiler: cross
+            kcflags: -O3 -march=armv8.7-a+crypto -mtune=cortex-x4
+            tuning: -O3 -march=armv8.7-a+crypto -mtune=cortex-x4
+            localversion: -WSL2-STABLE-Const
+            image_target: Image
+            image_path: arch/arm64/boot/Image
+            image_name: Image-arm64
+          - name: x64
+            arch: x86_64
+            cache_arch: x64
+            config_file: arch/x86/configs/config-wsl-x86
+            compiler: native
+            kcflags: -O3 -march=x86-64-v4 -mtune=znver4
+            tuning: -O3 -march=x86-64-v4 -mtune=znver4
+            localversion: -WSL2-STABLE-ZEN4
+            image_target: bzImage
+            image_path: arch/x86/boot/bzImage
+            image_name: bzImage-x64
 
     steps:
       - name: Checkout workflow repo
@@ -28,16 +57,23 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: ${{ runner.os }}-ccache-nevuly-x64-${{ github.sha }}
+          key: ${{ runner.os }}-ccache-nevuly-${{ matrix.cache_arch }}-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-ccache-nevuly-x64-
+            ${{ runner.os }}-ccache-nevuly-${{ matrix.cache_arch }}-
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential flex bison bc dwarves libssl-dev libelf-dev \
-            ccache
+            build-essential flex bison bc dwarves libssl-dev libelf-dev ccache
+
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            sudo apt-get install -y \
+              gcc-14-aarch64-linux-gnu g++-14-aarch64-linux-gnu \
+              crossbuild-essential-arm64
+            sudo update-alternatives --install /usr/bin/aarch64-linux-gnu-gcc aarch64-linux-gnu-gcc /usr/bin/aarch64-linux-gnu-gcc-14 100
+            sudo update-alternatives --install /usr/bin/aarch64-linux-gnu-g++ aarch64-linux-gnu-g++ /usr/bin/aarch64-linux-gnu-g++-14 100
+          fi
 
       - name: Clone kernel source (Nevuly)
         id: clone
@@ -86,17 +122,20 @@ jobs:
 
       - name: Configure kernel (base defconfig + local deltas)
         run: |
-          export ARCH=x86_64
-          export CC="ccache gcc"
+          export ARCH=${{ matrix.arch }}
+          export KCFLAGS="${{ matrix.kcflags }}"
           export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
           export CCACHE_COMPILERCHECK=content
-          export KCFLAGS="-O3 -march=x86-64-v4 -mtune=znver4"
+          if [ "${{ matrix.compiler }}" = "cross" ]; then
+            export CROSS_COMPILE="ccache aarch64-linux-gnu-"
+          else
+            export CC="ccache gcc"
+          fi
 
           ccache -M 5G
           ccache -z
 
-          cp linux/arch/x86/configs/config-wsl-x86 linux/.config
-
+          cp "linux/${{ matrix.config_file }}" linux/.config
           cd linux
 
           # Extra debloat from working-config analysis (compile-heavy subsystems)
@@ -108,6 +147,9 @@ jobs:
           ./scripts/config --disable CONFIG_SOUND
           ./scripts/config --disable CONFIG_MEDIA_SUPPORT
           ./scripts/config --disable CONFIG_VIDEO
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            ./scripts/config --disable CONFIG_ARM64_PLATFORM_DEVICES
+          fi
           ./scripts/config --disable CONFIG_XEN
           ./scripts/config --disable CONFIG_SURFACE_PLATFORMS
           ./scripts/config --disable CONFIG_MELLANOX_PLATFORM
@@ -125,7 +167,10 @@ jobs:
           ./scripts/config --enable CONFIG_HZ_250
           ./scripts/config --enable CONFIG_DRM
           ./scripts/config --enable CONFIG_DRM_VGEM
+          ./scripts/config --enable CONFIG_USBIP_CORE
           ./scripts/config --enable CONFIG_USBIP_VHCI_HCD
+          ./scripts/config --enable CONFIG_USB_SERIAL
+          ./scripts/config --enable CONFIG_USB_SERIAL_CH341
           ./scripts/config --set-val CONFIG_HZ 250
 
           # Speed up compilation
@@ -138,18 +183,22 @@ jobs:
           ./scripts/config --disable CONFIG_KCOV
           ./scripts/config --disable CONFIG_GDB_SCRIPTS
           ./scripts/config --disable CONFIG_RUST
-          ./scripts/config --set-str CONFIG_LOCALVERSION "-WSL2-STABLE-ZEN4"
+          ./scripts/config --set-str CONFIG_LOCALVERSION "${{ matrix.localversion }}"
 
-          make ARCH=x86_64 KCFLAGS="$KCFLAGS" olddefconfig
+          make ARCH=${{ matrix.arch }} KCFLAGS="$KCFLAGS" olddefconfig
 
       - name: Build kernel
         run: |
-          export ARCH=x86_64
-          export CC="ccache gcc"
+          export ARCH=${{ matrix.arch }}
+          export KCFLAGS="${{ matrix.kcflags }}"
           export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
-          export KCFLAGS="-O3 -march=x86-64-v4 -mtune=znver4"
+          if [ "${{ matrix.compiler }}" = "cross" ]; then
+            export CROSS_COMPILE="ccache aarch64-linux-gnu-"
+          else
+            export CC="ccache gcc"
+          fi
 
-          make -C linux ARCH=x86_64 KCFLAGS="$KCFLAGS" -j"$(nproc)" bzImage modules
+          make -C linux ARCH=${{ matrix.arch }} KCFLAGS="$KCFLAGS" -j"$(nproc)" ${{ matrix.image_target }} modules
           ccache -s
 
       - name: Prepare artifacts
@@ -158,18 +207,19 @@ jobs:
           BUILD_DATE="$(date -u +%Y%m%d)"
           mkdir -p artifacts
 
-          cp linux/arch/x86/boot/bzImage artifacts/bzImage-x64
-          cp linux/.config artifacts/config-x64-nevuly-base
-          cp linux/System.map artifacts/System.map-x64
-          cp linux/Module.symvers artifacts/Module.symvers-x64
+          cp "linux/${{ matrix.image_path }}" "artifacts/${{ matrix.image_name }}"
+          cp linux/.config "artifacts/config-${{ matrix.cache_arch }}-nevuly-base"
+          cp linux/System.map "artifacts/System.map-${{ matrix.cache_arch }}"
+          cp linux/Module.symvers "artifacts/Module.symvers-${{ matrix.cache_arch }}"
 
           {
             echo "Kernel Source: Nevuly/WSL2-Linux-Kernel-Rolling"
             echo "Ref: $KERNEL_REF"
             echo "Commit: $(git -C linux rev-parse HEAD)"
             echo "Date: $(date -u)"
-            echo "Platform: x64"
-            echo "Tuning: -O3 -march=x86-64-v4 -mtune=znver4"
+            echo "Platform: ${{ matrix.name }}"
+            echo "Tuning: ${{ matrix.tuning }}"
+            echo "USB serial: CH341 enabled"
           } > artifacts/build-info.txt
 
           echo "build_date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
@@ -177,7 +227,45 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: wsl-x64-${{ steps.prep.outputs.build_date }}-${{ steps.clone.outputs.kernel_sha }}
+          name: wsl-${{ matrix.cache_arch }}-${{ steps.prep.outputs.build_date }}-${{ steps.clone.outputs.kernel_sha }}
           path: artifacts/
           retention-days: 30
           if-no-files-found: error
+
+  publish-kernel-release:
+    name: Publish kernel nightly release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    needs: [build-kernel]
+    if: needs.build-kernel.result == 'success'
+    steps:
+      - name: Download ARM64 and x64 kernel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wsl-*-*
+          path: release-assets
+          merge-multiple: false
+
+      - name: Set kernel release metadata
+        id: release
+        shell: bash
+        run: |
+          echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          echo "tag=kernel-nightly-$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish kernel nightly release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: Nevuly Rolling Kernel Nightly ${{ steps.release.outputs.date }}
+          prerelease: true
+          make_latest: false
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          files: release-assets/**/*
+          body: |
+            ARM64 and x64 kernels built from Nevuly/WSL2-Linux-Kernel-Rolling.
+
+            Includes each architecture's kernel image, config, System.map, Module.symvers, and build information.
+            Re-running this workflow on the same day updates this release's assets.
