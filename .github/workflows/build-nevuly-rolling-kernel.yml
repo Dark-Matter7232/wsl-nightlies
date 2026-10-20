@@ -247,6 +247,22 @@ jobs:
           path: release-assets
           merge-multiple: false
 
+      - name: Package one ZIP per architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arch in arm64 x64; do
+            artifact_dir="$(find release-assets -mindepth 1 -maxdepth 1 -type d -name "wsl-${arch}-*" -print -quit)"
+            if [[ -z "$artifact_dir" ]]; then
+              echo "No downloaded artifact found for $arch"
+              exit 1
+            fi
+
+            archive="release-assets/$(basename "$artifact_dir").zip"
+            (cd "$artifact_dir" && zip -qr "../$(basename "$archive")" .)
+            echo "Created $archive"
+          done
+
       - name: Set kernel release metadata
         id: release
         shell: bash
@@ -263,7 +279,7 @@ jobs:
           make_latest: false
           fail_on_unmatched_files: true
           overwrite_files: true
-          files: release-assets/**/*
+          files: release-assets/*.zip
           body: |
             ARM64 and x64 kernels built from Nevuly/WSL2-Linux-Kernel-Rolling.
 
